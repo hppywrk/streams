@@ -10,8 +10,8 @@ const JOB_PROPERTY_PREFIX = "job_";
 const PROCESSOR_HANDLER = "processJobQueue";
 const POLL_HANDLER = "pollJobQueue";
 const POLL_WORKER_FLAG = "poll_worker_installed";
-/** One job per webhook keeps HTTP short; other jobs run in parallel executions. */
-const MAX_JOBS_PER_WEBHOOK = 1;
+/** Fast-path jobs only in webhook; Gemini runs in time-based triggers. */
+const MAX_QUICK_JOBS_PER_WEBHOOK = 20;
 
 const SMALL_TALK_REPLY =
   "👋 Привет! Я помогаю создавать проекты: папка на Google Drive и задача в Google Tasks.\n\n" +
@@ -47,7 +47,11 @@ function doPost(e) {
     const chatId = update.message.chat.id;
     const userText = update.message.text.trim();
 
-    const claim = claimUpdateForProcessing(updateId);
+    let claim = claimUpdateForProcessing(updateId);
+    if (claim === "busy") {
+      Utilities.sleep(2000);
+      claim = claimUpdateForProcessing(updateId);
+    }
     if (claim === "duplicate") {
       return okOutput;
     }
@@ -70,7 +74,7 @@ function doPost(e) {
       sendTelegramMessage(chatId, "⏳ Запрос принят, обрабатываю...");
     }
 
-    drainJobQueue(MAX_JOBS_PER_WEBHOOK);
+    drainJobQueue(MAX_QUICK_JOBS_PER_WEBHOOK, true);
     if (getQueueLength() > 0) {
       scheduleJobProcessor();
     }
@@ -108,14 +112,16 @@ function releaseUpdateDedup(updateId) {
 }
 
 function enqueueJob(job) {
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty(JOB_PROPERTY_PREFIX + job.updateId, JSON.stringify(job));
+  withScriptLock(15000, function () {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty(JOB_PROPERTY_PREFIX + job.updateId, JSON.stringify(job));
 
-  const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
-  if (queue.indexOf(job.updateId) === -1) {
-    queue.push(job.updateId);
-    props.setProperty(QUEUE_PROPERTY_KEY, JSON.stringify(queue));
-  }
+    const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
+    if (queue.indexOf(job.updateId) === -1) {
+      queue.push(job.updateId);
+      props.setProperty(QUEUE_PROPERTY_KEY, JSON.stringify(queue));
+    }
+  });
 }
 
 function getQueueLength() {
@@ -160,36 +166,51 @@ function withScriptLock(maxWaitMs, fn) {
   }
 }
 
-function dequeueNextJob() {
+function isQuickJob(job) {
+  return job.isStart || job.isSmallTalk;
+}
+
+function dequeueNextJob(quickOnly) {
   return withScriptLock(15000, function () {
     const props = PropertiesService.getScriptProperties();
-    const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
-    if (queue.length === 0) {
-      return null;
+
+    while (true) {
+      const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
+      if (queue.length === 0) {
+        return null;
+      }
+
+      const updateId = queue[0];
+      const raw = props.getProperty(JOB_PROPERTY_PREFIX + updateId);
+      if (!raw) {
+        queue.shift();
+        props.setProperty(QUEUE_PROPERTY_KEY, JSON.stringify(queue));
+        continue;
+      }
+
+      const job = JSON.parse(raw);
+      if (quickOnly && !isQuickJob(job)) {
+        return null;
+      }
+
+      queue.shift();
+      props.setProperty(QUEUE_PROPERTY_KEY, JSON.stringify(queue));
+      props.deleteProperty(JOB_PROPERTY_PREFIX + updateId);
+      return job;
     }
-
-    const updateId = queue.shift();
-    props.setProperty(QUEUE_PROPERTY_KEY, JSON.stringify(queue));
-
-    const raw = props.getProperty(JOB_PROPERTY_PREFIX + updateId);
-    props.deleteProperty(JOB_PROPERTY_PREFIX + updateId);
-    if (!raw) {
-      return null;
-    }
-
-    return JSON.parse(raw);
   });
 }
 
 /**
  * Lock is held only while dequeuing — Gemini/Drive run without blocking other webhooks.
  */
-function drainJobQueue(maxJobs) {
+function drainJobQueue(maxJobs, quickOnly) {
   const limit = maxJobs === undefined ? 50 : maxJobs;
+  const onlyQuick = quickOnly === true;
   let processed = 0;
 
   while (processed < limit) {
-    const job = dequeueNextJob();
+    const job = dequeueNextJob(onlyQuick);
     if (!job) {
       break;
     }
