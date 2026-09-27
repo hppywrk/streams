@@ -8,6 +8,14 @@ const JOB_RESULT_PREFIX = "job_result_";
 const QUEUE_PROPERTY_KEY = "pending_update_ids";
 const JOB_PROPERTY_PREFIX = "job_";
 const PROCESSOR_HANDLER = "processJobQueue";
+const POLL_HANDLER = "pollJobQueue";
+const POLL_WORKER_FLAG = "poll_worker_installed";
+
+const AGENT_SYSTEM_INSTRUCTION =
+  "Ты бот Telegram. Твоя основная функция — по запросу пользователя создать папку на Google Drive и задачу в Google Tasks (инструмент createFolderAndTask). " +
+  "Вызывай createFolderAndTask только когда пользователь явно просит создать проект, задачу или папку. " +
+  "Если сообщение — приветствие, болтовня, вопрос не про создание проекта или команда непонятна — ответь коротким текстом (без вызова инструмента): " +
+  "объясни, что ты умеешь создавать проекты (папка + задача), и попроси написать название проекта.";
 
 /**
  * Telegram webhook: dedupe, enqueue, return OK immediately.
@@ -18,6 +26,8 @@ function doPost(e) {
   );
 
   try {
+    ensurePollWorkerTrigger();
+
     if (!e || !e.postData || !e.postData.contents) {
       return okOutput;
     }
@@ -29,9 +39,14 @@ function doPost(e) {
 
     const updateId = update.update_id;
     const chatId = update.message.chat.id;
-    const userText = update.message.text;
+    const userText = update.message.text.trim();
 
-    if (!claimUpdateForProcessing(updateId)) {
+    const claim = claimUpdateForProcessing(updateId);
+    if (claim === "duplicate") {
+      return okOutput;
+    }
+    if (claim === "busy") {
+      // Could not claim in time; let Telegram retry this update later.
       return okOutput;
     }
 
@@ -47,8 +62,7 @@ function doPost(e) {
       sendTelegramMessage(chatId, "⏳ Запрос принят, обрабатываю...");
     }
 
-    // Run now when idle; one-shot triggers are often delayed 1–2+ minutes.
-    tryProcessQueueNow();
+    processQueueWithWait(25000);
     scheduleJobProcessor();
   } catch (err) {
     Logger.log("Ошибка в doPost: " + err.toString());
@@ -58,25 +72,29 @@ function doPost(e) {
 }
 
 /**
- * Atomic dedup: lock + cache so parallel webhook retries see the same update_id once.
+ * @returns {"new"|"duplicate"|"busy"}
  */
 function claimUpdateForProcessing(updateId) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) {
-    return false;
+  if (!lock.tryLock(30000)) {
+    return "busy";
   }
 
   try {
     const cache = CacheService.getScriptCache();
     const key = DEDUP_CACHE_PREFIX + updateId;
     if (cache.get(key)) {
-      return false;
+      return "duplicate";
     }
     cache.put(key, "1", CACHE_TTL_SEC);
-    return true;
+    return "new";
   } finally {
     lock.releaseLock();
   }
+}
+
+function releaseUpdateDedup(updateId) {
+  CacheService.getScriptCache().remove(DEDUP_CACHE_PREFIX + updateId);
 }
 
 function enqueueJob(job) {
@@ -90,6 +108,13 @@ function enqueueJob(job) {
   }
 }
 
+function getQueueLength() {
+  const queue = JSON.parse(
+    PropertiesService.getScriptProperties().getProperty(QUEUE_PROPERTY_KEY) || "[]"
+  );
+  return queue.length;
+}
+
 function scheduleJobProcessor() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
@@ -97,7 +122,15 @@ function scheduleJobProcessor() {
   }
 
   try {
-    ScriptApp.newTrigger(PROCESSOR_HANDLER).timeBased().after(1000).create();
+    if (getQueueLength() === 0) {
+      return;
+    }
+    const existing = ScriptApp.getProjectTriggers().filter(function (t) {
+      return t.getHandlerFunction() === PROCESSOR_HANDLER;
+    });
+    if (existing.length < 3) {
+      ScriptApp.newTrigger(PROCESSOR_HANDLER).timeBased().after(1000).create();
+    }
   } catch (err) {
     Logger.log("scheduleJobProcessor: " + err.toString());
   } finally {
@@ -105,10 +138,10 @@ function scheduleJobProcessor() {
   }
 }
 
-/** Try to drain the queue in this execution (webhook path). */
-function tryProcessQueueNow() {
+/** Wait briefly for the lock so back-to-back messages drain in one webhook when possible. */
+function processQueueWithWait(maxWaitMs) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(0)) {
+  if (!lock.tryLock(maxWaitMs)) {
     return;
   }
 
@@ -119,28 +152,27 @@ function tryProcessQueueNow() {
   }
 }
 
-/**
- * Backup runner for installable time triggers (slow to start; queue may already be empty).
- */
-function processJobQueue() {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(30000)) {
-    return;
-  }
+function tryProcessQueueNow() {
+  processQueueWithWait(0);
+}
 
-  try {
-    drainJobQueue();
-  } finally {
-    lock.releaseLock();
-    deleteTriggersForHandler(PROCESSOR_HANDLER);
+function processJobQueue() {
+  processQueueWithWait(30000);
+  deleteTriggersForHandler(PROCESSOR_HANDLER);
+  if (getQueueLength() > 0) {
+    scheduleJobProcessor();
   }
 }
 
 function drainJobQueue() {
   const props = PropertiesService.getScriptProperties();
-  let queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
 
-  while (queue.length > 0) {
+  while (true) {
+    const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
+    if (queue.length === 0) {
+      break;
+    }
+
     const updateId = queue.shift();
     props.setProperty(QUEUE_PROPERTY_KEY, JSON.stringify(queue));
 
@@ -155,7 +187,13 @@ function drainJobQueue() {
       handleQueuedJob(job);
     } catch (err) {
       Logger.log("drainJobQueue job " + updateId + ": " + err.toString());
-      sendTelegramMessage(job.chatId, "❌ Ошибка обработки: " + err.toString());
+      releaseUpdateDedup(updateId);
+      sendTelegramMessage(
+        job.chatId,
+        "❌ Ошибка обработки. Попробуйте отправить сообщение ещё раз.\n\n_" +
+          err.toString() +
+          "_"
+      );
     }
   }
 }
@@ -198,7 +236,23 @@ function formatAgentReply(agentResult) {
       agentResult.folderName
     );
   }
-  return "🤖 *Ответ:* " + agentResult;
+
+  if (typeof agentResult === "object" && agentResult.status === "unrecognized") {
+    return (
+      "🤷 *Не удалось распознать команду.*\n\n" +
+      "Я умею создавать *проект*: папку на Google Drive и задачу в Google Tasks.\n\n" +
+      "Напишите, например: _Создай проект Ремонт кухни_"
+    );
+  }
+
+  if (typeof agentResult === "string" && agentResult.length > 0) {
+    return "🤖 " + agentResult;
+  }
+
+  return (
+    "🤷 *Не понял запрос.*\n\n" +
+    "Опишите проект, который нужно создать (папка на Drive + задача в Google Tasks)."
+  );
 }
 
 /**
@@ -232,6 +286,9 @@ function runAgent(userPrompt, updateId) {
   ];
 
   const payload = {
+    systemInstruction: {
+      parts: [{ text: AGENT_SYSTEM_INSTRUCTION }],
+    },
     contents: [
       {
         role: "user",
@@ -269,21 +326,38 @@ function runAgent(userPrompt, updateId) {
     const json = JSON.parse(responseText);
 
     if (!json.candidates || json.candidates.length === 0) {
-      return "Gemini не вернула вариантов ответа.";
+      return { status: "unrecognized" };
     }
 
-    const part = json.candidates[0].content.parts[0];
-
-    if (part.functionCall && part.functionCall.name === "createFolderAndTask") {
-      const projectName = part.functionCall.args.projectName;
-      return executeCreateFolderAndTask(projectName, updateId);
+    const parts = json.candidates[0].content && json.candidates[0].content.parts;
+    if (!parts || parts.length === 0) {
+      return { status: "unrecognized" };
     }
 
-    if (part.text) {
-      return part.text;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+
+      if (part.functionCall) {
+        if (part.functionCall.name === "createFolderAndTask") {
+          const args = part.functionCall.args || {};
+          const projectName = (args.projectName || "").trim();
+          if (!projectName) {
+            return {
+              status: "unrecognized",
+              reason: "empty_project_name",
+            };
+          }
+          return executeCreateFolderAndTask(projectName, updateId);
+        }
+        return { status: "unrecognized", tool: part.functionCall.name };
+      }
+
+      if (part.text && part.text.trim()) {
+        return part.text.trim();
+      }
     }
 
-    return "Запрос обработан.";
+    return { status: "unrecognized" };
   } catch (e) {
     Logger.log("❌ Исключение: " + e.toString());
     return "Ошибка выполнения: " + e.toString();
@@ -335,7 +409,7 @@ function executeCreateFolderAndTask(projectName, updateId) {
 
 function sendTelegramMessage(chatId, text) {
   const url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage";
-  UrlFetchApp.fetch(url, {
+  const response = UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify({
@@ -344,7 +418,14 @@ function sendTelegramMessage(chatId, text) {
       parse_mode: "Markdown",
       disable_web_page_preview: false,
     }),
+    muteHttpExceptions: true,
   });
+  const code = response.getResponseCode();
+  if (code !== 200) {
+    Logger.log(
+      "sendTelegramMessage failed (" + code + "): " + response.getContentText()
+    );
+  }
 }
 
 function deleteTriggersForHandler(handlerName) {
@@ -353,6 +434,36 @@ function deleteTriggersForHandler(handlerName) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
+}
+
+function ensurePollWorkerTrigger() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(POLL_WORKER_FLAG) === "1") {
+    return;
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    return;
+  }
+
+  try {
+    if (props.getProperty(POLL_WORKER_FLAG) === "1") {
+      return;
+    }
+
+    const existing = ScriptApp.getProjectTriggers().filter(function (t) {
+      return t.getHandlerFunction() === POLL_HANDLER;
+    });
+    if (existing.length === 0) {
+      ScriptApp.newTrigger(POLL_HANDLER).timeBased().everyMinutes(1).create();
+    }
+    props.setProperty(POLL_WORKER_FLAG, "1");
+  } catch (err) {
+    Logger.log("ensurePollWorkerTrigger: " + err.toString());
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
@@ -366,6 +477,7 @@ function hardReset() {
 
   const props = PropertiesService.getScriptProperties();
   props.deleteProperty(QUEUE_PROPERTY_KEY);
+  props.deleteProperty(POLL_WORKER_FLAG);
   const keys = props.getKeys();
   for (let i = 0; i < keys.length; i++) {
     if (keys[i].indexOf(JOB_PROPERTY_PREFIX) === 0) {
@@ -408,22 +520,21 @@ function testRunner() {
   Logger.log("Результат: " + JSON.stringify(result, null, 2));
 }
 
-/**
- * Run once from the editor: minute poll catches jobs if the one-shot trigger is late.
- */
+/** Manual fallback if auto-install of poll worker failed (run once from editor). */
 function setupAsyncWorkers() {
-  deleteTriggersForHandler("pollJobQueue");
-  ScriptApp.newTrigger("pollJobQueue").timeBased().everyMinutes(1).create();
-  Logger.log("pollJobQueue trigger installed (every 1 minute).");
+  PropertiesService.getScriptProperties().deleteProperty(POLL_WORKER_FLAG);
+  ensurePollWorkerTrigger();
+  Logger.log("pollJobQueue trigger ensured (every 1 minute).");
 }
 
 function pollJobQueue() {
-  const props = PropertiesService.getScriptProperties();
-  const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
-  if (queue.length === 0) {
+  if (getQueueLength() === 0) {
     return;
   }
-  tryProcessQueueNow();
+  processQueueWithWait(30000);
+  if (getQueueLength() > 0) {
+    scheduleJobProcessor();
+  }
 }
 
 function reloadWebhook() {
