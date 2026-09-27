@@ -10,6 +10,12 @@ const JOB_PROPERTY_PREFIX = "job_";
 const PROCESSOR_HANDLER = "processJobQueue";
 const POLL_HANDLER = "pollJobQueue";
 const POLL_WORKER_FLAG = "poll_worker_installed";
+/** One job per webhook keeps HTTP short; other jobs run in parallel executions. */
+const MAX_JOBS_PER_WEBHOOK = 1;
+
+const SMALL_TALK_REPLY =
+  "👋 Привет! Я помогаю создавать проекты: папка на Google Drive и задача в Google Tasks.\n\n" +
+  "Напишите, например: «Создай проект Название»";
 
 const AGENT_SYSTEM_INSTRUCTION =
   "Ты бот Telegram. Твоя основная функция — по запросу пользователя создать папку на Google Drive и задачу в Google Tasks (инструмент createFolderAndTask). " +
@@ -46,24 +52,28 @@ function doPost(e) {
       return okOutput;
     }
     if (claim === "busy") {
-      // Could not claim in time; let Telegram retry this update later.
+      Logger.log("claim busy for update " + updateId);
       return okOutput;
     }
 
     const isStart = userText === "/start";
+    const isSmallTalk = !isStart && isSmallTalkMessage(userText);
     enqueueJob({
       updateId: updateId,
       chatId: chatId,
       userText: userText,
       isStart: isStart,
+      isSmallTalk: isSmallTalk,
     });
 
-    if (!isStart) {
+    if (!isStart && !isSmallTalk) {
       sendTelegramMessage(chatId, "⏳ Запрос принят, обрабатываю...");
     }
 
-    processQueueWithWait(25000);
-    scheduleJobProcessor();
+    drainJobQueue(MAX_JOBS_PER_WEBHOOK);
+    if (getQueueLength() > 0) {
+      scheduleJobProcessor();
+    }
   } catch (err) {
     Logger.log("Ошибка в doPost: " + err.toString());
   }
@@ -138,39 +148,24 @@ function scheduleJobProcessor() {
   }
 }
 
-/** Wait briefly for the lock so back-to-back messages drain in one webhook when possible. */
-function processQueueWithWait(maxWaitMs) {
+function withScriptLock(maxWaitMs, fn) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(maxWaitMs)) {
-    return;
+    return null;
   }
-
   try {
-    drainJobQueue();
+    return fn();
   } finally {
     lock.releaseLock();
   }
 }
 
-function tryProcessQueueNow() {
-  processQueueWithWait(0);
-}
-
-function processJobQueue() {
-  processQueueWithWait(30000);
-  deleteTriggersForHandler(PROCESSOR_HANDLER);
-  if (getQueueLength() > 0) {
-    scheduleJobProcessor();
-  }
-}
-
-function drainJobQueue() {
-  const props = PropertiesService.getScriptProperties();
-
-  while (true) {
+function dequeueNextJob() {
+  return withScriptLock(15000, function () {
+    const props = PropertiesService.getScriptProperties();
     const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
     if (queue.length === 0) {
-      break;
+      return null;
     }
 
     const updateId = queue.shift();
@@ -179,23 +174,60 @@ function drainJobQueue() {
     const raw = props.getProperty(JOB_PROPERTY_PREFIX + updateId);
     props.deleteProperty(JOB_PROPERTY_PREFIX + updateId);
     if (!raw) {
-      continue;
+      return null;
     }
 
-    const job = JSON.parse(raw);
+    return JSON.parse(raw);
+  });
+}
+
+/**
+ * Lock is held only while dequeuing — Gemini/Drive run without blocking other webhooks.
+ */
+function drainJobQueue(maxJobs) {
+  const limit = maxJobs === undefined ? 50 : maxJobs;
+  let processed = 0;
+
+  while (processed < limit) {
+    const job = dequeueNextJob();
+    if (!job) {
+      break;
+    }
+    processed++;
+
     try {
       handleQueuedJob(job);
     } catch (err) {
-      Logger.log("drainJobQueue job " + updateId + ": " + err.toString());
-      releaseUpdateDedup(updateId);
+      Logger.log("drainJobQueue job " + job.updateId + ": " + err.toString());
+      releaseUpdateDedup(job.updateId);
       sendTelegramMessage(
         job.chatId,
-        "❌ Ошибка обработки. Попробуйте отправить сообщение ещё раз.\n\n_" +
-          err.toString() +
-          "_"
+        "❌ Ошибка обработки. Попробуйте отправить сообщение ещё раз.\n\n" +
+          err.toString()
       );
     }
   }
+}
+
+function processJobQueue() {
+  drainJobQueue();
+  deleteTriggersForHandler(PROCESSOR_HANDLER);
+  if (getQueueLength() > 0) {
+    scheduleJobProcessor();
+  }
+}
+
+function isSmallTalkMessage(text) {
+  const normalized = text.toLowerCase().trim();
+  if (normalized.length > 80) {
+    return false;
+  }
+  if (/^(привет|здравствуй|здарова|хай|hello|hi|hey|ку)[\s,!?.—-]*/i.test(normalized)) {
+    return true;
+  }
+  return /^(как дела|как ты|что делаешь|как поживаешь|как сам)[\s,!?.—-]*/i.test(
+    normalized
+  );
 }
 
 function handleQueuedJob(job) {
@@ -204,6 +236,11 @@ function handleQueuedJob(job) {
       job.chatId,
       "👋 Привет! Я твой AI-ассистент. Напиши, какой проект или задачу нужно создать."
     );
+    return;
+  }
+
+  if (job.isSmallTalk) {
+    sendTelegramMessage(job.chatId, SMALL_TALK_REPLY);
     return;
   }
 
@@ -408,24 +445,40 @@ function executeCreateFolderAndTask(projectName, updateId) {
 }
 
 function sendTelegramMessage(chatId, text) {
+  if (trySendTelegram(chatId, text, "Markdown")) {
+    return;
+  }
+  if (trySendTelegram(chatId, text, null)) {
+    return;
+  }
+  Logger.log("sendTelegramMessage failed for chat " + chatId);
+}
+
+function trySendTelegram(chatId, text, parseMode) {
   const url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage";
+  const body = {
+    chat_id: chatId,
+    text: text,
+    disable_web_page_preview: false,
+  };
+  if (parseMode) {
+    body.parse_mode = parseMode;
+  }
+
   const response = UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify({
-      chat_id: chatId,
-      text: text,
-      parse_mode: "Markdown",
-      disable_web_page_preview: false,
-    }),
+    payload: JSON.stringify(body),
     muteHttpExceptions: true,
   });
   const code = response.getResponseCode();
   if (code !== 200) {
     Logger.log(
-      "sendTelegramMessage failed (" + code + "): " + response.getContentText()
+      "trySendTelegram (" + (parseMode || "plain") + ") " + code + ": " + response.getContentText()
     );
+    return false;
   }
+  return true;
 }
 
 function deleteTriggersForHandler(handlerName) {
@@ -531,7 +584,7 @@ function pollJobQueue() {
   if (getQueueLength() === 0) {
     return;
   }
-  processQueueWithWait(30000);
+  drainJobQueue(10);
   if (getQueueLength() > 0) {
     scheduleJobProcessor();
   }
