@@ -35,12 +35,20 @@ function doPost(e) {
       return okOutput;
     }
 
+    const isStart = userText === "/start";
     enqueueJob({
       updateId: updateId,
       chatId: chatId,
       userText: userText,
-      isStart: userText === "/start",
+      isStart: isStart,
     });
+
+    if (!isStart) {
+      sendTelegramMessage(chatId, "⏳ Запрос принят, обрабатываю...");
+    }
+
+    // Run now when idle; one-shot triggers are often delayed 1–2+ minutes.
+    tryProcessQueueNow();
     scheduleJobProcessor();
   } catch (err) {
     Logger.log("Ошибка в doPost: " + err.toString());
@@ -89,23 +97,46 @@ function scheduleJobProcessor() {
   }
 
   try {
-    const existing = ScriptApp.getProjectTriggers().filter(function (t) {
-      return t.getHandlerFunction() === PROCESSOR_HANDLER;
-    });
-    if (existing.length === 0) {
-      ScriptApp.newTrigger(PROCESSOR_HANDLER).timeBased().after(1000).create();
-    }
+    ScriptApp.newTrigger(PROCESSOR_HANDLER).timeBased().after(1000).create();
+  } catch (err) {
+    Logger.log("scheduleJobProcessor: " + err.toString());
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Try to drain the queue in this execution (webhook path). */
+function tryProcessQueueNow() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) {
+    return;
+  }
+
+  try {
+    drainJobQueue();
   } finally {
     lock.releaseLock();
   }
 }
 
 /**
- * Runs outside the webhook (installable time trigger). Heavy work happens here.
+ * Backup runner for installable time triggers (slow to start; queue may already be empty).
  */
 function processJobQueue() {
-  deleteTriggersForHandler(PROCESSOR_HANDLER);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    return;
+  }
 
+  try {
+    drainJobQueue();
+  } finally {
+    lock.releaseLock();
+    deleteTriggersForHandler(PROCESSOR_HANDLER);
+  }
+}
+
+function drainJobQueue() {
   const props = PropertiesService.getScriptProperties();
   let queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
 
@@ -123,7 +154,7 @@ function processJobQueue() {
     try {
       handleQueuedJob(job);
     } catch (err) {
-      Logger.log("processJobQueue job " + updateId + ": " + err.toString());
+      Logger.log("drainJobQueue job " + updateId + ": " + err.toString());
       sendTelegramMessage(job.chatId, "❌ Ошибка обработки: " + err.toString());
     }
   }
@@ -145,8 +176,6 @@ function handleQueuedJob(job) {
     sendTelegramMessage(job.chatId, formatAgentReply(JSON.parse(cachedResult)));
     return;
   }
-
-  sendTelegramMessage(job.chatId, "⏳ Запрос принят, обрабатываю...");
 
   const agentResult = runAgent(job.userText, job.updateId);
   CacheService.getScriptCache().put(
@@ -335,7 +364,14 @@ function hardReset() {
     ScriptApp.deleteTrigger(triggers[i]);
   }
 
-  PropertiesService.getScriptProperties().deleteProperty(QUEUE_PROPERTY_KEY);
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(QUEUE_PROPERTY_KEY);
+  const keys = props.getKeys();
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i].indexOf(JOB_PROPERTY_PREFIX) === 0) {
+      props.deleteProperty(keys[i]);
+    }
+  }
 
   const WEB_APP_URL =
     "https://script.google.com/macros/s/AKfycbzv1T_buK84F5IQOGW5gLWVsqR0cpo69RCOttPs7J__-lbe1udT-jQOeISsWoxbazeo/exec";
@@ -370,6 +406,24 @@ function clearTelegramQueue() {
 function testRunner() {
   const result = runAgent("Создай проект Проверка Таймаута", 999999001);
   Logger.log("Результат: " + JSON.stringify(result, null, 2));
+}
+
+/**
+ * Run once from the editor: minute poll catches jobs if the one-shot trigger is late.
+ */
+function setupAsyncWorkers() {
+  deleteTriggersForHandler("pollJobQueue");
+  ScriptApp.newTrigger("pollJobQueue").timeBased().everyMinutes(1).create();
+  Logger.log("pollJobQueue trigger installed (every 1 minute).");
+}
+
+function pollJobQueue() {
+  const props = PropertiesService.getScriptProperties();
+  const queue = JSON.parse(props.getProperty(QUEUE_PROPERTY_KEY) || "[]");
+  if (queue.length === 0) {
+    return;
+  }
+  tryProcessQueueNow();
 }
 
 function reloadWebhook() {
